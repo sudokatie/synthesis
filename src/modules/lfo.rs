@@ -136,4 +136,55 @@ mod tests {
         lfo.reset();
         assert_eq!(lfo.phase, 0.0);
     }
+
+    #[test]
+    fn test_lfo_frequency_range() {
+        let mut lfo = Lfo::new(Waveform::Sine, 1.0, 44100);
+        lfo.set_frequency(200.0);
+        assert_eq!(lfo.frequency, 100.0); // Clamped to max
+        lfo.set_frequency(0.001);
+        assert_eq!(lfo.frequency, 0.01); // Clamped to min
+    }
+
+    #[test]
+    fn test_lfo_triangle() {
+        let mut lfo = Lfo::new(Waveform::Triangle, 10.0, 44100);
+        for _ in 0..4410 {
+            let s = lfo.process_sample();
+            assert!(s >= -1.0 && s <= 1.0);
+        }
+    }
+
+    #[test]
+    fn test_lfo_saw() {
+        let mut lfo = Lfo::new(Waveform::Saw, 10.0, 44100);
+        for _ in 0..4410 {
+            let s = lfo.process_sample();
+            assert!(s >= -1.0 && s <= 1.0);
+        }
+    }
+
+    #[test]
+    fn test_lfo_square() {
+        let mut lfo = Lfo::new(Waveform::Square { pulse_width: 0.5 }, 10.0, 44100);
+        for _ in 0..4410 {
+            let s = lfo.process_sample();
+            assert!(s >= -1.0 && s <= 1.0);
+        }
+    }
+
+    #[test]
+    fn test_lfo_process_buffer() {
+        let mut lfo = Lfo::new(Waveform::Sine, 10.0, 44100);
+        let mut buffer = vec![0.0; 256];
+        lfo.process(&mut buffer);
+        assert!(buffer.iter().any(|&s| s != 0.0));
+    }
+
+    #[test]
+    fn test_lfo_value() {
+        let lfo = Lfo::new(Waveform::Sine, 1.0, 44100);
+        let v = lfo.value();
+        assert!(v >= -1.0 && v <= 1.0);
+    }
 }

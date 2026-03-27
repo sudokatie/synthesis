@@ -199,4 +199,75 @@ mod tests {
         assert_eq!(filter.lp, 0.0);
         assert_eq!(filter.bp, 0.0);
     }
+
+    #[test]
+    fn test_svf_highpass() {
+        let mut filter = StateVariableFilter::new(44100);
+        filter.set_cutoff(100.0);
+        filter.set_mode(FilterMode::HighPass);
+        // DC should be blocked by highpass
+        for _ in 0..2000 {
+            let _ = filter.process_sample(1.0);
+        }
+        let out = filter.process_sample(1.0);
+        assert!(out.abs() < 0.2, "HP should block DC: {}", out);
+    }
+
+    #[test]
+    fn test_svf_bandpass() {
+        let mut filter = StateVariableFilter::new(44100);
+        filter.set_cutoff(1000.0);
+        filter.set_resonance(0.8);
+        filter.set_mode(FilterMode::BandPass);
+        let out = filter.process_sample(1.0);
+        assert!(out.is_finite());
+    }
+
+    #[test]
+    fn test_svf_notch() {
+        let mut filter = StateVariableFilter::new(44100);
+        filter.set_cutoff(1000.0);
+        filter.set_mode(FilterMode::Notch);
+        let out = filter.process_sample(1.0);
+        assert!(out.is_finite());
+    }
+
+    #[test]
+    fn test_svf_cutoff_range() {
+        let mut filter = StateVariableFilter::new(44100);
+        filter.set_cutoff(50000.0);
+        assert_eq!(filter.cutoff, 20000.0);
+        filter.set_cutoff(5.0);
+        assert_eq!(filter.cutoff, 20.0);
+    }
+
+    #[test]
+    fn test_moog_process() {
+        let mut filter = MoogLadder::new(44100);
+        filter.set_cutoff(2000.0);
+        filter.set_resonance(0.5);
+        let mut buffer = vec![0.0; 256];
+        for (i, s) in buffer.iter_mut().enumerate() {
+            let input = (i as f32 * 0.1).sin();
+            *s = filter.process_sample(input);
+        }
+        assert!(buffer.iter().any(|&s| s != 0.0));
+    }
+
+    #[test]
+    fn test_moog_reset() {
+        let mut filter = MoogLadder::new(44100);
+        filter.process_sample(1.0);
+        filter.reset();
+        assert_eq!(filter.stage, [0.0; 4]);
+    }
+
+    #[test]
+    fn test_moog_saturation() {
+        let mut filter = MoogLadder::new(44100);
+        filter.set_cutoff(5000.0);
+        // Large input should be saturated
+        let out = filter.process_sample(10.0);
+        assert!(out.abs() < 5.0, "Should saturate: {}", out);
+    }
 }

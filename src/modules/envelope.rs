@@ -181,4 +181,45 @@ mod tests {
         }
         assert_eq!(env.stage(), EnvelopeStage::Idle);
     }
+
+    #[test]
+    fn test_envelope_retrigger() {
+        let mut env = Envelope::new(0.01, 0.1, 0.5, 0.5, 44100);
+        env.trigger();
+        for _ in 0..500 {
+            env.process_sample();
+        }
+        // Retrigger during attack
+        env.trigger();
+        assert_eq!(env.stage(), EnvelopeStage::Attack);
+    }
+
+    #[test]
+    fn test_envelope_value_range() {
+        let mut env = Envelope::new(0.01, 0.1, 0.7, 0.5, 44100);
+        env.trigger();
+        for _ in 0..10000 {
+            let v = env.process_sample();
+            assert!(v >= 0.0 && v <= 1.0, "Value out of range: {}", v);
+        }
+    }
+
+    #[test]
+    fn test_envelope_process_buffer() {
+        let mut env = Envelope::new(0.01, 0.1, 0.7, 0.5, 44100);
+        let mut buffer = vec![0.0; 256];
+        env.trigger();
+        env.process(&mut buffer);
+        assert!(buffer.iter().any(|&v| v > 0.0));
+    }
+
+    #[test]
+    fn test_envelope_idle_stays_zero() {
+        let mut env = Envelope::new(0.01, 0.1, 0.7, 0.5, 44100);
+        // Don't trigger
+        for _ in 0..100 {
+            let v = env.process_sample();
+            assert_eq!(v, 0.0);
+        }
+    }
 }
