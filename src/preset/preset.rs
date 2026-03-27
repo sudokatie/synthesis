@@ -1,0 +1,1 @@
+//! Preset structure and serialization

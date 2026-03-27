@@ -1,0 +1,33 @@
+[package]
+name = "synthesis"
+version = "0.1.0"
+edition = "2021"
+description = "Modular synthesizer engine with oscillators, filters, and MIDI"
+license = "MIT"
+authors = ["Katie"]
+repository = "https://github.com/sudokatie/synthesis"
+keywords = ["audio", "synthesizer", "dsp", "midi"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+cpal = "0.15"
+midir = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+rand = "0.8"
+
+[dev-dependencies]
+criterion = "0.5"
+hound = "3.5"
+approx = "0.5"
+
+[[bench]]
+name = "synthesis_bench"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1

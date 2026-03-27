@@ -1,0 +1,4 @@
+//! MIDI handling
+
+pub mod parser;
+pub mod state;
