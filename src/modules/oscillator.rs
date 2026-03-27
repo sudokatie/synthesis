@@ -1,6 +1,6 @@
 //! Oscillator module - waveform generation with anti-aliasing
 
-use crate::dsp::{polyblep, saw_polyblep, square_polyblep};
+use crate::dsp::{cubic_interp, saw_polyblep, square_polyblep};
 
 /// Waveform types
 #[derive(Debug, Clone)]
@@ -10,12 +10,36 @@ pub enum Waveform {
     Square { pulse_width: f32 },
     Triangle,
     Noise,
+    /// Wavetable with samples and position (0.0-1.0 for morphing)
+    Wavetable { table: Vec<f32>, position: f32 },
 }
 
 impl Default for Waveform {
     fn default() -> Self {
         Waveform::Saw
     }
+}
+
+/// Generate a basic wavetable (one cycle of a waveform)
+pub fn generate_wavetable(waveform: &str, size: usize) -> Vec<f32> {
+    let mut table = vec![0.0; size];
+    for i in 0..size {
+        let phase = i as f32 / size as f32;
+        table[i] = match waveform {
+            "sine" => (phase * std::f32::consts::TAU).sin(),
+            "saw" => 2.0 * phase - 1.0,
+            "square" => if phase < 0.5 { 1.0 } else { -1.0 },
+            "triangle" => {
+                if phase < 0.5 {
+                    4.0 * phase - 1.0
+                } else {
+                    3.0 - 4.0 * phase
+                }
+            }
+            _ => 0.0,
+        };
+    }
+    table
 }
 
 /// Oscillator with anti-aliasing
@@ -75,7 +99,7 @@ impl Oscillator {
             Waveform::Saw => saw_polyblep(self.phase, dt),
             Waveform::Square { pulse_width } => square_polyblep(self.phase, dt, *pulse_width),
             Waveform::Triangle => {
-                // Naive triangle (TODO: integrate square for bandlimited)
+                // Naive triangle
                 if self.phase < 0.5 {
                     4.0 * self.phase - 1.0
                 } else {
@@ -83,6 +107,15 @@ impl Oscillator {
                 }
             }
             Waveform::Noise => rand::random::<f32>() * 2.0 - 1.0,
+            Waveform::Wavetable { table, position: _ } => {
+                if table.is_empty() {
+                    0.0
+                } else {
+                    // Use cubic interpolation for smooth wavetable playback
+                    let index = self.phase * table.len() as f32;
+                    cubic_interp(table, index)
+                }
+            }
         };
 
         // Advance phase
@@ -174,5 +207,83 @@ mod tests {
         osc.process(&mut buffer);
         // Should have non-zero values
         assert!(buffer.iter().any(|&s| s != 0.0));
+    }
+
+    #[test]
+    fn test_triangle_range() {
+        let mut osc = Oscillator::new(Waveform::Triangle, 44100);
+        osc.set_frequency(440.0);
+        for _ in 0..1000 {
+            let sample = osc.process_sample();
+            assert!(sample >= -1.0 && sample <= 1.0);
+        }
+    }
+
+    #[test]
+    fn test_wavetable_sine() {
+        let table = generate_wavetable("sine", 256);
+        let mut osc = Oscillator::new(
+            Waveform::Wavetable { table, position: 0.0 },
+            44100,
+        );
+        osc.set_frequency(440.0);
+        for _ in 0..1000 {
+            let sample = osc.process_sample();
+            assert!(sample >= -1.1 && sample <= 1.1);
+        }
+    }
+
+    #[test]
+    fn test_wavetable_saw() {
+        let table = generate_wavetable("saw", 256);
+        let mut osc = Oscillator::new(
+            Waveform::Wavetable { table, position: 0.0 },
+            44100,
+        );
+        osc.set_frequency(440.0);
+        let mut buffer = vec![0.0; 256];
+        osc.process(&mut buffer);
+        assert!(buffer.iter().any(|&s| s != 0.0));
+    }
+
+    #[test]
+    fn test_generate_wavetable_size() {
+        let table = generate_wavetable("sine", 512);
+        assert_eq!(table.len(), 512);
+    }
+
+    #[test]
+    fn test_reset_phase() {
+        let mut osc = Oscillator::new(Waveform::Sine, 44100);
+        osc.process_sample();
+        osc.process_sample();
+        assert!(osc.phase > 0.0);
+        osc.reset();
+        assert_eq!(osc.phase, 0.0);
+    }
+
+    #[test]
+    fn test_frequency_clamping() {
+        let mut osc = Oscillator::new(Waveform::Sine, 44100);
+        osc.set_frequency(50000.0);
+        assert_eq!(osc.frequency, 20000.0);
+        osc.set_frequency(5.0);
+        assert_eq!(osc.frequency, 20.0);
+    }
+
+    #[test]
+    fn test_pulse_width_variations() {
+        let mut osc = Oscillator::new(Waveform::Square { pulse_width: 0.25 }, 44100);
+        osc.set_frequency(440.0);
+        let mut high_count = 0;
+        for _ in 0..4410 {
+            let s = osc.process_sample();
+            if s > 0.5 {
+                high_count += 1;
+            }
+        }
+        // With 25% pulse width, roughly 25% should be high
+        let ratio = high_count as f32 / 4410.0;
+        assert!(ratio > 0.15 && ratio < 0.35, "Pulse width ratio: {}", ratio);
     }
 }

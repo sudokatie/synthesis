@@ -65,6 +65,14 @@ impl Lfo {
                 }
             }
             Waveform::Noise => rand::random::<f32>() * 2.0 - 1.0,
+            Waveform::Wavetable { table, .. } => {
+                if table.is_empty() {
+                    0.0
+                } else {
+                    let index = (phase * table.len() as f32) as usize % table.len();
+                    table[index]
+                }
+            }
         };
 
         match self.polarity {
