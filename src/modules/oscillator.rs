@@ -48,8 +48,11 @@ pub struct Oscillator {
     waveform: Waveform,
     frequency: f32,
     phase: f32,
-    detune: f32, // cents
+    detune: f32,      // cents
     sample_rate: f32,
+    // Modulation inputs
+    fm_amount: f32,   // FM depth in Hz
+    pm_amount: f32,   // PM depth in radians
 }
 
 impl Oscillator {
@@ -61,6 +64,85 @@ impl Oscillator {
             phase: 0.0,
             detune: 0.0,
             sample_rate: sample_rate as f32,
+            fm_amount: 0.0,
+            pm_amount: 0.0,
+        }
+    }
+
+    /// Set FM (frequency modulation) amount in Hz
+    pub fn set_fm_amount(&mut self, amount: f32) {
+        self.fm_amount = amount;
+    }
+
+    /// Set PM (phase modulation) amount in radians
+    pub fn set_pm_amount(&mut self, amount: f32) {
+        self.pm_amount = amount;
+    }
+
+    /// Process with FM input (modulator signal)
+    pub fn process_sample_fm(&mut self, fm_input: f32) -> f32 {
+        let freq = self.effective_frequency() + fm_input * self.fm_amount;
+        let freq = freq.max(0.0);
+        let dt = freq / self.sample_rate;
+        
+        let sample = self.generate_sample(self.phase);
+        
+        self.phase += dt;
+        if self.phase >= 1.0 {
+            self.phase -= 1.0;
+        }
+        
+        sample
+    }
+
+    /// Process with PM input (modulator signal)
+    pub fn process_sample_pm(&mut self, pm_input: f32) -> f32 {
+        let freq = self.effective_frequency();
+        let dt = freq / self.sample_rate;
+        
+        // Apply phase modulation
+        let modulated_phase = (self.phase + pm_input * self.pm_amount / std::f32::consts::TAU).fract();
+        let modulated_phase = if modulated_phase < 0.0 { modulated_phase + 1.0 } else { modulated_phase };
+        
+        let sample = self.generate_sample(modulated_phase);
+        
+        self.phase += dt;
+        if self.phase >= 1.0 {
+            self.phase -= 1.0;
+        }
+        
+        sample
+    }
+
+    /// Hard sync - reset phase when sync signal crosses zero
+    pub fn sync(&mut self) {
+        self.phase = 0.0;
+    }
+
+    fn generate_sample(&self, phase: f32) -> f32 {
+        let freq = self.effective_frequency();
+        let dt = freq / self.sample_rate;
+        
+        match &self.waveform {
+            Waveform::Sine => (phase * std::f32::consts::TAU).sin(),
+            Waveform::Saw => saw_polyblep(phase, dt),
+            Waveform::Square { pulse_width } => square_polyblep(phase, dt, *pulse_width),
+            Waveform::Triangle => {
+                if phase < 0.5 {
+                    4.0 * phase - 1.0
+                } else {
+                    3.0 - 4.0 * phase
+                }
+            }
+            Waveform::Noise => rand::random::<f32>() * 2.0 - 1.0,
+            Waveform::Wavetable { table, .. } => {
+                if table.is_empty() {
+                    0.0
+                } else {
+                    let index = phase * table.len() as f32;
+                    cubic_interp(table, index)
+                }
+            }
         }
     }
 
@@ -94,29 +176,7 @@ impl Oscillator {
         let freq = self.effective_frequency();
         let dt = freq / self.sample_rate;
 
-        let sample = match &self.waveform {
-            Waveform::Sine => (self.phase * std::f32::consts::TAU).sin(),
-            Waveform::Saw => saw_polyblep(self.phase, dt),
-            Waveform::Square { pulse_width } => square_polyblep(self.phase, dt, *pulse_width),
-            Waveform::Triangle => {
-                // Naive triangle
-                if self.phase < 0.5 {
-                    4.0 * self.phase - 1.0
-                } else {
-                    3.0 - 4.0 * self.phase
-                }
-            }
-            Waveform::Noise => rand::random::<f32>() * 2.0 - 1.0,
-            Waveform::Wavetable { table, position: _ } => {
-                if table.is_empty() {
-                    0.0
-                } else {
-                    // Use cubic interpolation for smooth wavetable playback
-                    let index = self.phase * table.len() as f32;
-                    cubic_interp(table, index)
-                }
-            }
-        };
+        let sample = self.generate_sample(self.phase);
 
         // Advance phase
         self.phase += dt;
@@ -285,5 +345,51 @@ mod tests {
         // With 25% pulse width, roughly 25% should be high
         let ratio = high_count as f32 / 4410.0;
         assert!(ratio > 0.15 && ratio < 0.35, "Pulse width ratio: {}", ratio);
+    }
+
+    #[test]
+    fn test_fm_modulation() {
+        let mut osc = Oscillator::new(Waveform::Sine, 44100);
+        osc.set_frequency(440.0);
+        osc.set_fm_amount(100.0);
+        
+        // FM should change pitch based on modulator
+        let s1 = osc.process_sample_fm(0.0);  // No mod
+        osc.reset();
+        let s2 = osc.process_sample_fm(1.0);  // +100Hz
+        // Both should produce valid samples
+        assert!(s1.abs() <= 1.0);
+        assert!(s2.abs() <= 1.0);
+    }
+
+    #[test]
+    fn test_pm_modulation() {
+        let mut osc = Oscillator::new(Waveform::Sine, 44100);
+        osc.set_frequency(440.0);
+        osc.set_pm_amount(std::f32::consts::PI);
+        
+        // PM should shift phase
+        let s1 = osc.process_sample_pm(0.0);
+        osc.reset();
+        let s2 = osc.process_sample_pm(0.5);  // Half cycle shift
+        // Both valid
+        assert!(s1.abs() <= 1.0);
+        assert!(s2.abs() <= 1.0);
+    }
+
+    #[test]
+    fn test_hard_sync() {
+        let mut osc = Oscillator::new(Waveform::Saw, 44100);
+        osc.set_frequency(440.0);
+        
+        // Advance phase
+        for _ in 0..100 {
+            osc.process_sample();
+        }
+        assert!(osc.phase > 0.0);
+        
+        // Sync resets phase
+        osc.sync();
+        assert_eq!(osc.phase, 0.0);
     }
 }
