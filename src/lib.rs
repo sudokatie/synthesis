@@ -24,8 +24,11 @@ pub mod preset;
 pub mod prelude {
     pub use crate::audio::{AudioConfig, AudioOutput};
     pub use crate::dsp::{db_to_linear, linear_to_db, midi_to_freq};
-    pub use crate::engine::{Engine, EngineConfig, ProcessContext};
+    pub use crate::effects::{Chorus, Delay, Limiter, SchroederReverb, StereoDelay};
+    pub use crate::engine::{Engine, EngineConfig, PlayMode, ProcessContext, StealMode, SynthVoice, SynthVoiceManager, VoiceParams};
+    pub use crate::midi::{MidiMessage, MidiState, parse_midi};
     pub use crate::modules::{Envelope, Filter, Lfo, Oscillator, Waveform};
+    pub use crate::preset::{Preset, builtin_presets};
 }
 
 /// Sample rate type alias

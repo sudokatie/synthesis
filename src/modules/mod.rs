@@ -1,11 +1,11 @@
 //! Synthesis modules (oscillators, filters, envelopes, LFOs)
 
-mod envelope;
-mod filter;
-mod lfo;
-mod oscillator;
+pub mod envelope;
+pub mod filter;
+pub mod lfo;
+pub mod oscillator;
 
-pub use envelope::Envelope;
+pub use envelope::{Envelope, EnvelopeStage};
 pub use filter::{Filter, FilterMode, MoogLadder, StateVariableFilter};
-pub use lfo::Lfo;
-pub use oscillator::{Oscillator, Waveform};
+pub use lfo::{Lfo, Polarity};
+pub use oscillator::{generate_wavetable, Oscillator, Waveform};
