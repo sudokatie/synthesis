@@ -4,5 +4,5 @@ pub mod preset;
 
 pub use preset::{
     builtin_presets, EffectsPreset, EnvelopePreset, FilterModePreset, FilterPreset,
-    OscillatorPreset, Preset, PresetError, WaveformPreset,
+    OscillatorPreset, Preset, PresetError, WaveformPreset, PRESET_VERSION,
 };

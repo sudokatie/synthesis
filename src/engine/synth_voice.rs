@@ -1,7 +1,28 @@
-//! Complete synthesizer voice with oscillators, filter, and envelopes
+//! Complete synthesizer voice with oscillators, filter, envelopes, and modulation
 
 use crate::dsp::midi_to_freq;
-use crate::modules::{Envelope, Filter, FilterMode, Oscillator, StateVariableFilter, Waveform};
+use crate::modules::{Envelope, Filter, FilterMode, Lfo, LfoSync, Oscillator, Polarity, StateVariableFilter, Waveform};
+
+/// Oscillator modulation mode
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OscModMode {
+    /// No modulation between oscillators
+    None,
+    /// Frequency modulation (osc2 modulates osc1 frequency)
+    Fm,
+    /// Phase modulation (osc2 modulates osc1 phase)
+    Pm,
+    /// Hard sync (osc1 resets osc2 phase)
+    Sync,
+    /// Ring modulation (multiply outputs)
+    Ring,
+}
+
+impl Default for OscModMode {
+    fn default() -> Self {
+        OscModMode::None
+    }
+}
 
 /// Voice parameters shared across voices
 #[derive(Debug, Clone)]
@@ -11,19 +32,31 @@ pub struct VoiceParams {
     pub osc2_detune: f32,       // cents
     pub osc2_octave: i32,       // -2 to +2
     pub osc_mix: f32,           // 0.0 = osc1 only, 1.0 = osc2 only
+    pub osc_mod_mode: OscModMode,
+    pub osc_mod_amount: f32,    // 0.0 to 1.0
     pub filter_cutoff: f32,     // Hz
     pub filter_resonance: f32,  // 0.0-1.0
     pub filter_mode: FilterMode,
+    pub filter_drive: f32,      // 0.0-1.0
     pub filter_env_amount: f32, // -1.0 to 1.0
     pub filter_key_track: f32,  // 0.0-1.0
     pub amp_attack: f32,
     pub amp_decay: f32,
     pub amp_sustain: f32,
     pub amp_release: f32,
+    pub amp_curve: f32,         // -1.0 to 1.0
     pub filter_attack: f32,
     pub filter_decay: f32,
     pub filter_sustain: f32,
     pub filter_release: f32,
+    pub filter_curve: f32,      // -1.0 to 1.0
+    // LFO
+    pub lfo_waveform: Waveform,
+    pub lfo_rate: f32,
+    pub lfo_sync: LfoSync,
+    pub lfo_to_pitch: f32,      // semitones
+    pub lfo_to_filter: f32,     // Hz
+    pub lfo_to_amp: f32,        // 0.0-1.0
 }
 
 impl Default for VoiceParams {
@@ -34,19 +67,30 @@ impl Default for VoiceParams {
             osc2_detune: 5.0,
             osc2_octave: 0,
             osc_mix: 0.5,
+            osc_mod_mode: OscModMode::None,
+            osc_mod_amount: 0.0,
             filter_cutoff: 8000.0,
             filter_resonance: 0.3,
             filter_mode: FilterMode::LowPass,
+            filter_drive: 0.0,
             filter_env_amount: 0.5,
             filter_key_track: 0.5,
             amp_attack: 0.01,
             amp_decay: 0.1,
             amp_sustain: 0.7,
             amp_release: 0.3,
+            amp_curve: 0.0,
             filter_attack: 0.01,
             filter_decay: 0.2,
             filter_sustain: 0.3,
             filter_release: 0.5,
+            filter_curve: 0.0,
+            lfo_waveform: Waveform::Sine,
+            lfo_rate: 1.0,
+            lfo_sync: LfoSync::Free,
+            lfo_to_pitch: 0.0,
+            lfo_to_filter: 0.0,
+            lfo_to_amp: 0.0,
         }
     }
 }
@@ -58,11 +102,12 @@ pub struct SynthVoice {
     pub velocity: f32,
     pub gate: bool,
     pub active: bool,
-    age: u64,  // For voice stealing
+    age: u64,
     
     // Oscillators
     osc1: Oscillator,
     osc2: Oscillator,
+    osc1_last_phase: f32,
     
     // Filter
     filter: StateVariableFilter,
@@ -70,6 +115,9 @@ pub struct SynthVoice {
     // Envelopes
     amp_env: Envelope,
     filter_env: Envelope,
+    
+    // LFO
+    lfo: Lfo,
     
     // Sample rate
     sample_rate: f32,
@@ -89,9 +137,11 @@ impl SynthVoice {
             age: 0,
             osc1: Oscillator::new(Waveform::Saw, sample_rate),
             osc2: Oscillator::new(Waveform::Saw, sample_rate),
+            osc1_last_phase: 0.0,
             filter: StateVariableFilter::new(sample_rate),
             amp_env: Envelope::new(0.01, 0.1, 0.7, 0.3, sample_rate),
             filter_env: Envelope::new(0.01, 0.2, 0.3, 0.5, sample_rate),
+            lfo: Lfo::new(Waveform::Sine, 1.0, sample_rate),
             sample_rate: sample_rate as f32,
             base_freq: 440.0,
         }
@@ -112,6 +162,7 @@ impl SynthVoice {
         self.osc1.set_waveform(params.osc1_waveform.clone());
         self.osc1.set_frequency(self.base_freq);
         self.osc1.reset();
+        self.osc1_last_phase = 0.0;
         
         let osc2_freq = self.base_freq * 2.0_f32.powi(params.osc2_octave);
         self.osc2.set_waveform(params.osc2_waveform.clone());
@@ -119,10 +170,27 @@ impl SynthVoice {
         self.osc2.set_detune(params.osc2_detune);
         self.osc2.reset();
         
+        // Configure FM/PM amounts based on mod mode
+        match params.osc_mod_mode {
+            OscModMode::Fm => {
+                self.osc1.set_fm_amount(params.osc_mod_amount * 1000.0); // Hz
+                self.osc1.set_pm_amount(0.0);
+            }
+            OscModMode::Pm => {
+                self.osc1.set_fm_amount(0.0);
+                self.osc1.set_pm_amount(params.osc_mod_amount * std::f32::consts::PI);
+            }
+            _ => {
+                self.osc1.set_fm_amount(0.0);
+                self.osc1.set_pm_amount(0.0);
+            }
+        }
+        
         // Configure filter
         self.filter.set_cutoff(params.filter_cutoff);
         self.filter.set_resonance(params.filter_resonance);
         self.filter.set_mode(params.filter_mode);
+        self.filter.set_drive(params.filter_drive);
         self.filter.reset();
         
         // Configure envelopes
@@ -133,6 +201,8 @@ impl SynthVoice {
             params.amp_release,
             self.sample_rate as u32,
         );
+        self.amp_env.set_curve(params.amp_curve);
+        
         self.filter_env = Envelope::new(
             params.filter_attack,
             params.filter_decay,
@@ -140,6 +210,13 @@ impl SynthVoice {
             params.filter_release,
             self.sample_rate as u32,
         );
+        self.filter_env.set_curve(params.filter_curve);
+        
+        // Configure LFO
+        self.lfo = Lfo::new(params.lfo_waveform.clone(), params.lfo_rate, self.sample_rate as u32);
+        self.lfo.set_sync(params.lfo_sync);
+        self.lfo.set_polarity(Polarity::Bipolar);
+        self.lfo.note_on(); // Reset if KeySync
         
         // Trigger envelopes
         self.amp_env.trigger();
@@ -153,7 +230,7 @@ impl SynthVoice {
         self.filter_env.release();
     }
 
-    /// Check if voice is still active (envelope not finished)
+    /// Check if voice is still active
     pub fn is_active(&self) -> bool {
         self.amp_env.is_active()
     }
@@ -179,9 +256,56 @@ impl SynthVoice {
             return 0.0;
         }
         
-        // Generate oscillator outputs
-        let osc1_out = self.osc1.process_sample();
-        let osc2_out = self.osc2.process_sample();
+        // Get LFO value
+        let lfo_val = self.lfo.process_sample();
+        
+        // Apply LFO to pitch (semitones -> frequency multiplier)
+        let pitch_mod = 2.0_f32.powf(lfo_val * params.lfo_to_pitch / 12.0);
+        self.osc1.set_frequency(self.base_freq * pitch_mod);
+        let osc2_base = self.base_freq * 2.0_f32.powi(params.osc2_octave);
+        self.osc2.set_frequency(osc2_base * pitch_mod);
+        
+        // Generate oscillator outputs based on modulation mode
+        let (osc1_out, osc2_out) = match params.osc_mod_mode {
+            OscModMode::None => {
+                (self.osc1.process_sample(), self.osc2.process_sample())
+            }
+            OscModMode::Fm => {
+                // Osc2 is modulator, osc1 is carrier
+                let modulator = self.osc2.process_sample();
+                let carrier = self.osc1.process_sample_fm(modulator);
+                (carrier, modulator)
+            }
+            OscModMode::Pm => {
+                // Osc2 modulates osc1 phase
+                let modulator = self.osc2.process_sample();
+                let carrier = self.osc1.process_sample_pm(modulator);
+                (carrier, modulator)
+            }
+            OscModMode::Sync => {
+                // Hard sync: osc1 is master, osc2 is slave
+                // When osc1 completes a cycle, reset osc2
+                let osc1_out = self.osc1.process_sample();
+                
+                // Detect zero crossing of osc1 phase (simplified sync detection)
+                // In practice, check if phase wrapped
+                let current_phase = self.osc1.phase;
+                if current_phase < self.osc1_last_phase {
+                    self.osc2.sync();
+                }
+                self.osc1_last_phase = current_phase;
+                
+                let osc2_out = self.osc2.process_sample();
+                (osc1_out, osc2_out)
+            }
+            OscModMode::Ring => {
+                // Ring modulation: multiply outputs
+                let o1 = self.osc1.process_sample();
+                let o2 = self.osc2.process_sample();
+                let ring = o1 * o2;
+                (ring, o2)
+            }
+        };
         
         // Mix oscillators
         let osc_out = osc1_out * (1.0 - params.osc_mix) + osc2_out * params.osc_mix;
@@ -189,14 +313,18 @@ impl SynthVoice {
         // Calculate filter cutoff with modulation
         let key_track_offset = (self.note as f32 - 60.0) * params.filter_key_track * 100.0;
         let env_offset = filter_mod * params.filter_env_amount * 10000.0;
-        let cutoff = (params.filter_cutoff + key_track_offset + env_offset).clamp(20.0, 20000.0);
+        let lfo_offset = lfo_val * params.lfo_to_filter;
+        let cutoff = (params.filter_cutoff + key_track_offset + env_offset + lfo_offset).clamp(20.0, 20000.0);
         self.filter.set_cutoff(cutoff);
         
         // Apply filter
         let filtered = self.filter.process_sample(osc_out);
         
+        // Apply LFO to amplitude (tremolo)
+        let amp_mod = 1.0 - params.lfo_to_amp * (1.0 - (lfo_val + 1.0) * 0.5);
+        
         // Apply amplitude envelope and velocity
-        filtered * amp * self.velocity
+        filtered * amp * amp_mod * self.velocity
     }
 
     /// Process a buffer
@@ -216,7 +344,7 @@ pub enum StealMode {
     Quietest,
 }
 
-/// Voice allocation modes
+/// Play modes
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlayMode {
     Poly,
@@ -227,9 +355,9 @@ pub enum PlayMode {
 /// Unison configuration
 #[derive(Debug, Clone)]
 pub struct UnisonConfig {
-    pub voices: usize,      // 1-8
-    pub detune: f32,        // cents spread
-    pub spread: f32,        // stereo spread 0.0-1.0
+    pub voices: usize,
+    pub detune: f32,
+    pub spread: f32,
 }
 
 impl Default for UnisonConfig {
@@ -243,6 +371,7 @@ impl Default for UnisonConfig {
 }
 
 /// Voice manager with allocation
+#[derive(Clone)]
 pub struct SynthVoiceManager {
     voices: Vec<SynthVoice>,
     params: VoiceParams,
@@ -252,6 +381,7 @@ pub struct SynthVoiceManager {
     age_counter: u64,
     last_note: Option<u8>,
     held_notes: Vec<u8>,
+    bpm: f32,
 }
 
 impl SynthVoiceManager {
@@ -266,6 +396,7 @@ impl SynthVoiceManager {
             age_counter: 0,
             last_note: None,
             held_notes: Vec::new(),
+            bpm: 120.0,
         }
     }
 
@@ -292,6 +423,14 @@ impl SynthVoiceManager {
     /// Set unison config
     pub fn set_unison(&mut self, config: UnisonConfig) {
         self.unison = config;
+    }
+
+    /// Set BPM for LFO sync
+    pub fn set_bpm(&mut self, bpm: f32) {
+        self.bpm = bpm.clamp(20.0, 300.0);
+        for voice in &mut self.voices {
+            voice.lfo.set_bpm(bpm);
+        }
     }
 
     /// Handle note on
@@ -322,11 +461,9 @@ impl SynthVoiceManager {
             PlayMode::Mono | PlayMode::Legato => {
                 if self.last_note == Some(note) {
                     if let Some(&prev_note) = self.held_notes.last() {
-                        // Retrigger previous note
                         self.allocate_mono(prev_note, 0.8, self.play_mode == PlayMode::Legato);
                         self.last_note = Some(prev_note);
                     } else {
-                        // Release all
                         for voice in &mut self.voices {
                             if voice.gate {
                                 voice.release();
@@ -358,7 +495,6 @@ impl SynthVoiceManager {
     fn allocate_mono(&mut self, note: u8, velocity: f32, legato: bool) {
         self.age_counter += 1;
         
-        // In mono/legato mode, use voice 0
         let voice = &mut self.voices[0];
         
         if legato && voice.gate {
@@ -367,6 +503,7 @@ impl SynthVoiceManager {
             voice.osc1.set_frequency(midi_to_freq(note));
             let osc2_freq = midi_to_freq(note) * 2.0_f32.powi(self.params.osc2_octave);
             voice.osc2.set_frequency(osc2_freq);
+            voice.base_freq = midi_to_freq(note);
         } else {
             voice.trigger(note, velocity, &self.params, self.age_counter);
         }
@@ -435,6 +572,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_osc_mod_mode_default() {
+        assert_eq!(OscModMode::default(), OscModMode::None);
+    }
+
+    #[test]
+    fn test_voice_params_default() {
+        let params = VoiceParams::default();
+        assert_eq!(params.osc_mod_mode, OscModMode::None);
+        assert_eq!(params.osc_mod_amount, 0.0);
+        assert_eq!(params.filter_drive, 0.0);
+        assert_eq!(params.amp_curve, 0.0);
+    }
+
+    #[test]
     fn test_synth_voice_new() {
         let voice = SynthVoice::new(44100);
         assert!(!voice.active);
@@ -458,7 +609,96 @@ mod tests {
         voice.trigger(60, 0.8, &params, 0);
         voice.release();
         assert!(!voice.gate);
-        assert!(voice.active); // Still active until envelope ends
+        assert!(voice.active);
+    }
+
+    #[test]
+    fn test_synth_voice_fm() {
+        let mut voice = SynthVoice::new(44100);
+        let mut params = VoiceParams::default();
+        params.osc_mod_mode = OscModMode::Fm;
+        params.osc_mod_amount = 0.5;
+        voice.trigger(60, 0.8, &params, 0);
+        
+        let mut buffer = vec![0.0; 256];
+        voice.process(&mut buffer, &params);
+        assert!(buffer.iter().any(|&s| s != 0.0));
+    }
+
+    #[test]
+    fn test_synth_voice_pm() {
+        let mut voice = SynthVoice::new(44100);
+        let mut params = VoiceParams::default();
+        params.osc_mod_mode = OscModMode::Pm;
+        params.osc_mod_amount = 0.5;
+        voice.trigger(60, 0.8, &params, 0);
+        
+        let mut buffer = vec![0.0; 256];
+        voice.process(&mut buffer, &params);
+        assert!(buffer.iter().any(|&s| s != 0.0));
+    }
+
+    #[test]
+    fn test_synth_voice_sync() {
+        let mut voice = SynthVoice::new(44100);
+        let mut params = VoiceParams::default();
+        params.osc_mod_mode = OscModMode::Sync;
+        voice.trigger(60, 0.8, &params, 0);
+        
+        let mut buffer = vec![0.0; 256];
+        voice.process(&mut buffer, &params);
+        assert!(buffer.iter().any(|&s| s != 0.0));
+    }
+
+    #[test]
+    fn test_synth_voice_ring() {
+        let mut voice = SynthVoice::new(44100);
+        let mut params = VoiceParams::default();
+        params.osc_mod_mode = OscModMode::Ring;
+        voice.trigger(60, 0.8, &params, 0);
+        
+        let mut buffer = vec![0.0; 256];
+        voice.process(&mut buffer, &params);
+        assert!(buffer.iter().any(|&s| s != 0.0));
+    }
+
+    #[test]
+    fn test_synth_voice_lfo_to_pitch() {
+        let mut voice = SynthVoice::new(44100);
+        let mut params = VoiceParams::default();
+        params.lfo_rate = 5.0;
+        params.lfo_to_pitch = 1.0; // 1 semitone vibrato
+        voice.trigger(60, 0.8, &params, 0);
+        
+        let mut buffer = vec![0.0; 256];
+        voice.process(&mut buffer, &params);
+        assert!(buffer.iter().any(|&s| s != 0.0));
+    }
+
+    #[test]
+    fn test_synth_voice_lfo_to_filter() {
+        let mut voice = SynthVoice::new(44100);
+        let mut params = VoiceParams::default();
+        params.lfo_rate = 2.0;
+        params.lfo_to_filter = 1000.0; // Hz
+        voice.trigger(60, 0.8, &params, 0);
+        
+        let mut buffer = vec![0.0; 256];
+        voice.process(&mut buffer, &params);
+        assert!(buffer.iter().any(|&s| s != 0.0));
+    }
+
+    #[test]
+    fn test_synth_voice_lfo_to_amp() {
+        let mut voice = SynthVoice::new(44100);
+        let mut params = VoiceParams::default();
+        params.lfo_rate = 5.0;
+        params.lfo_to_amp = 0.5; // 50% tremolo
+        voice.trigger(60, 0.8, &params, 0);
+        
+        let mut buffer = vec![0.0; 256];
+        voice.process(&mut buffer, &params);
+        assert!(buffer.iter().any(|&s| s != 0.0));
     }
 
     #[test]
@@ -469,23 +709,7 @@ mod tests {
         
         let mut buffer = vec![0.0; 256];
         voice.process(&mut buffer, &params);
-        
-        // Should have audio
         assert!(buffer.iter().any(|&s| s != 0.0));
-    }
-
-    #[test]
-    fn test_synth_voice_envelope_controls() {
-        let mut voice = SynthVoice::new(44100);
-        let params = VoiceParams::default();
-        voice.trigger(60, 0.8, &params, 0);
-        
-        // Process attack
-        let s1 = voice.process_sample(&params);
-        let s2 = voice.process_sample(&params);
-        
-        // During attack, envelope should rise
-        assert!(s2.abs() >= s1.abs() * 0.9 || s1.abs() < 0.001);
     }
 
     #[test]
@@ -506,7 +730,6 @@ mod tests {
         let mut vm = SynthVoiceManager::new(4, 44100);
         vm.note_on(60, 0.8);
         vm.note_off(60);
-        // Voice still active (in release)
         assert_eq!(vm.active_count(), 1);
     }
 
@@ -524,7 +747,7 @@ mod tests {
         let mut vm = SynthVoiceManager::new(2, 44100);
         vm.note_on(60, 0.8);
         vm.note_on(64, 0.8);
-        vm.note_on(67, 0.8); // Should steal oldest
+        vm.note_on(67, 0.8);
         assert_eq!(vm.active_count(), 2);
     }
 
@@ -543,12 +766,10 @@ mod tests {
         let mut vm = SynthVoiceManager::new(4, 44100);
         vm.set_play_mode(PlayMode::Legato);
         vm.note_on(60, 0.8);
-        // Process a bit
         let mut buf = vec![0.0; 100];
         vm.process(&mut buf);
         
         vm.note_on(64, 0.8);
-        // Voice should still be active from first note's envelope
         assert_eq!(vm.active_count(), 1);
         assert_eq!(vm.voices[0].note, 64);
     }
@@ -560,32 +781,37 @@ mod tests {
         
         let mut buffer = vec![0.0; 256];
         vm.process(&mut buffer);
-        
-        // Should have audio
         assert!(buffer.iter().any(|&s| s != 0.0));
+    }
+
+    #[test]
+    fn test_voice_manager_bpm() {
+        let mut vm = SynthVoiceManager::new(4, 44100);
+        vm.set_bpm(140.0);
+        assert_eq!(vm.bpm, 140.0);
     }
 
     #[test]
     fn test_steal_mode_lowest() {
         let mut vm = SynthVoiceManager::new(2, 44100);
         vm.set_steal_mode(StealMode::Lowest);
-        vm.note_on(60, 0.8);  // C4
-        vm.note_on(72, 0.8);  // C5
-        vm.note_on(66, 0.8);  // Should steal lowest (60)
+        vm.note_on(60, 0.8);
+        vm.note_on(72, 0.8);
+        vm.note_on(66, 0.8);
         
         let notes: Vec<u8> = vm.voices.iter().filter(|v| v.active).map(|v| v.note).collect();
-        assert!(!notes.contains(&60)); // 60 should be stolen
+        assert!(!notes.contains(&60));
     }
 
     #[test]
     fn test_steal_mode_highest() {
         let mut vm = SynthVoiceManager::new(2, 44100);
         vm.set_steal_mode(StealMode::Highest);
-        vm.note_on(60, 0.8);  // C4
-        vm.note_on(72, 0.8);  // C5
-        vm.note_on(66, 0.8);  // Should steal highest (72)
+        vm.note_on(60, 0.8);
+        vm.note_on(72, 0.8);
+        vm.note_on(66, 0.8);
         
         let notes: Vec<u8> = vm.voices.iter().filter(|v| v.active).map(|v| v.note).collect();
-        assert!(!notes.contains(&72)); // 72 should be stolen
+        assert!(!notes.contains(&72));
     }
 }

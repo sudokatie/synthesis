@@ -4,12 +4,12 @@
 #[derive(Debug, Clone)]
 pub struct ProcessContext {
     pub sample_rate: u32,
-    pub buffer_size: usize,
+    pub buffer_size: u32,
     pub tempo: f32,
 }
 
 impl ProcessContext {
-    pub fn new(sample_rate: u32, buffer_size: usize) -> Self {
+    pub fn new(sample_rate: u32, buffer_size: u32) -> Self {
         Self {
             sample_rate,
             buffer_size,

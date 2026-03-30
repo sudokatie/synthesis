@@ -7,5 +7,5 @@ pub mod oscillator;
 
 pub use envelope::{Envelope, EnvelopeStage};
 pub use filter::{Filter, FilterMode, MoogLadder, StateVariableFilter};
-pub use lfo::{Lfo, Polarity};
-pub use oscillator::{generate_wavetable, Oscillator, Waveform};
+pub use lfo::{Lfo, LfoSync, Polarity};
+pub use oscillator::{generate_morph_wavetables, generate_wavetable, Oscillator, Waveform};

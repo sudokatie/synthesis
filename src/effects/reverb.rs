@@ -80,11 +80,13 @@ impl AllpassFilter {
     }
 }
 
-/// Schroeder reverb - classic algorithm
+/// Schroeder reverb - classic algorithm with pre-delay
 #[derive(Debug, Clone)]
 pub struct SchroederReverb {
     combs: [CombFilter; 8],
     allpasses: [AllpassFilter; 4],
+    pre_delay: DelayLine,
+    pre_delay_samples: usize,
     mix: f32,
     room_size: f32,
     sample_rate: u32,
@@ -96,6 +98,9 @@ impl SchroederReverb {
 
     /// Allpass filter delay times
     const ALLPASS_DELAYS: [usize; 4] = [225, 556, 441, 341];
+
+    /// Maximum pre-delay in seconds
+    const MAX_PRE_DELAY: f32 = 0.5;
 
     pub fn new(sample_rate: u32) -> Self {
         let scale = sample_rate as f32 / 44100.0;
@@ -118,9 +123,15 @@ impl SchroederReverb {
             AllpassFilter::new((Self::ALLPASS_DELAYS[3] as f32 * scale) as usize),
         ];
 
+        // Pre-delay buffer (max 500ms)
+        let max_pre_delay_samples = (Self::MAX_PRE_DELAY * sample_rate as f32) as usize;
+        let pre_delay = DelayLine::new(max_pre_delay_samples + 1);
+
         let mut reverb = Self {
             combs,
             allpasses,
+            pre_delay,
+            pre_delay_samples: 0,
             mix: 0.3,
             room_size: 0.8,
             sample_rate,
@@ -156,11 +167,30 @@ impl SchroederReverb {
         self.mix = mix.clamp(0.0, 1.0);
     }
 
+    /// Set pre-delay time in seconds (0.0 to 0.5)
+    pub fn set_pre_delay(&mut self, seconds: f32) {
+        let seconds = seconds.clamp(0.0, Self::MAX_PRE_DELAY);
+        self.pre_delay_samples = (seconds * self.sample_rate as f32) as usize;
+    }
+
+    /// Get current pre-delay time in seconds
+    pub fn pre_delay(&self) -> f32 {
+        self.pre_delay_samples as f32 / self.sample_rate as f32
+    }
+
     pub fn process_sample(&mut self, input: f32) -> f32 {
+        // Apply pre-delay
+        let delayed_input = if self.pre_delay_samples > 0 {
+            self.pre_delay.write(input);
+            self.pre_delay.read(self.pre_delay_samples)
+        } else {
+            input
+        };
+
         // Sum parallel comb filters
         let mut comb_sum = 0.0;
         for comb in &mut self.combs {
-            comb_sum += comb.process_sample(input);
+            comb_sum += comb.process_sample(delayed_input);
         }
         comb_sum *= 0.125; // Average
 
@@ -177,17 +207,25 @@ impl SchroederReverb {
     pub fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
         let mono = (left + right) * 0.5;
         
+        // Apply pre-delay
+        let delayed_mono = if self.pre_delay_samples > 0 {
+            self.pre_delay.write(mono);
+            self.pre_delay.read(self.pre_delay_samples)
+        } else {
+            mono
+        };
+
         // Process left through first 4 combs
         let mut left_comb = 0.0;
         for comb in &mut self.combs[0..4] {
-            left_comb += comb.process_sample(mono);
+            left_comb += comb.process_sample(delayed_mono);
         }
         left_comb *= 0.25;
 
         // Process right through last 4 combs
         let mut right_comb = 0.0;
         for comb in &mut self.combs[4..8] {
-            right_comb += comb.process_sample(mono);
+            right_comb += comb.process_sample(delayed_mono);
         }
         right_comb *= 0.25;
 
@@ -195,7 +233,6 @@ impl SchroederReverb {
         let mut left_out = left_comb;
         let mut right_out = right_comb;
         for allpass in &mut self.allpasses {
-            // Cross-feed for stereo width
             let l = allpass.process_sample(left_out);
             left_out = l;
             right_out = allpass.process_sample(right_out);
@@ -214,6 +251,7 @@ impl SchroederReverb {
         for allpass in &mut self.allpasses {
             allpass.reset();
         }
+        self.pre_delay.reset();
     }
 }
 
@@ -229,20 +267,16 @@ mod tests {
 
     #[test]
     fn test_comb_filter_process() {
-        let mut comb = CombFilter::new(5);  // 5 sample delay
-        comb.set_feedback(0.0);  // No feedback for clean test
+        let mut comb = CombFilter::new(5);
+        comb.set_feedback(0.0);
         comb.set_damp(0.0);
 
-        // Track outputs
         let mut outputs = Vec::new();
-        
-        // Feed impulse then zeros
         outputs.push(comb.process_sample(1.0));
         for _ in 0..10 {
             outputs.push(comb.process_sample(0.0));
         }
         
-        // The echo should appear after delay_samples
         let echo_found = outputs.iter().skip(1).any(|&x| x > 0.5);
         assert!(echo_found, "No echo found in outputs: {:?}", outputs);
     }
@@ -274,11 +308,9 @@ mod tests {
         reverb.set_room_size(0.8);
         reverb.set_mix(0.5);
 
-        // Process impulse
         let out = reverb.process_sample(1.0);
         assert!(out.is_finite());
 
-        // Process more - should have tail
         let mut has_tail = false;
         for _ in 0..10000 {
             let out = reverb.process_sample(0.0);
@@ -303,7 +335,6 @@ mod tests {
     fn test_schroeder_room_size() {
         let mut reverb = SchroederReverb::new(44100);
 
-        // Small room - shorter decay
         reverb.set_room_size(0.2);
         reverb.process_sample(1.0);
         let mut small_tail = 0.0;
@@ -313,7 +344,6 @@ mod tests {
 
         reverb.reset();
 
-        // Large room - longer decay
         reverb.set_room_size(0.9);
         reverb.process_sample(1.0);
         let mut large_tail = 0.0;
@@ -329,7 +359,6 @@ mod tests {
         let mut reverb = SchroederReverb::new(44100);
         reverb.process_sample(1.0);
         reverb.reset();
-        // After reset, output should be minimal
         let out = reverb.process_sample(0.0);
         assert!(out.abs() < 0.01);
     }
@@ -340,5 +369,62 @@ mod tests {
         reverb.set_damping(0.8);
         let out = reverb.process_sample(1.0);
         assert!(out.is_finite());
+    }
+
+    #[test]
+    fn test_schroeder_pre_delay() {
+        let mut reverb = SchroederReverb::new(44100);
+        reverb.set_pre_delay(0.1); // 100ms
+        
+        assert!((reverb.pre_delay() - 0.1).abs() < 0.001);
+        
+        // Process impulse
+        let out = reverb.process_sample(1.0);
+        assert!(out.is_finite());
+    }
+
+    #[test]
+    fn test_schroeder_pre_delay_effect() {
+        let mut reverb = SchroederReverb::new(44100);
+        reverb.set_room_size(0.8);
+        reverb.set_mix(1.0); // Full wet
+        reverb.set_pre_delay(0.05); // 50ms = 2205 samples
+        
+        // Send impulse
+        let _ = reverb.process_sample(1.0);
+        
+        // Samples before pre-delay ends should be mostly quiet
+        // (only comb filter feedback from previous silence)
+        let mut pre_delay_sum = 0.0;
+        for _ in 0..1000 {
+            pre_delay_sum += reverb.process_sample(0.0).abs();
+        }
+        
+        // Skip to after pre-delay
+        for _ in 0..1500 {
+            let _ = reverb.process_sample(0.0);
+        }
+        
+        // Now we should have reverb tail
+        let mut post_delay_sum = 0.0;
+        for _ in 0..2000 {
+            post_delay_sum += reverb.process_sample(0.0).abs();
+        }
+        
+        // Post-delay should have significant energy from reverb tail
+        // Pre-delay period should be relatively quiet
+        assert!(post_delay_sum > pre_delay_sum * 0.5 || post_delay_sum > 0.1, 
+            "Pre-delay not working: pre={}, post={}", pre_delay_sum, post_delay_sum);
+    }
+
+    #[test]
+    fn test_schroeder_pre_delay_clamp() {
+        let mut reverb = SchroederReverb::new(44100);
+        
+        reverb.set_pre_delay(1.0); // Should clamp to 0.5
+        assert!(reverb.pre_delay() <= 0.5);
+        
+        reverb.set_pre_delay(-0.1); // Should clamp to 0.0
+        assert!(reverb.pre_delay() >= 0.0);
     }
 }

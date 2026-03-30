@@ -9,13 +9,15 @@ pub struct NoteState {
     pub note: u8,
     /// Velocity 0.0-1.0
     pub velocity: f32,
+    /// MIDI channel (0-15)
+    pub channel: u8,
 }
 
 /// Complete MIDI state tracker
 #[derive(Debug, Clone)]
 pub struct MidiState {
     /// Currently held notes
-    notes: Vec<NoteState>,
+    notes_held: Vec<NoteState>,
     /// CC values (0.0-1.0 for each controller)
     cc: [f32; 128],
     /// Pitch bend in semitones
@@ -39,7 +41,7 @@ impl MidiState {
         cc[cc::PAN as usize] = 0.5;
 
         Self {
-            notes: Vec::new(),
+            notes_held: Vec::new(),
             cc,
             pitch_bend: 0.0,
             pitch_bend_range: 2.0,
@@ -63,15 +65,15 @@ impl MidiState {
     /// Process a parsed MIDI message
     pub fn process_message(&mut self, msg: MidiMessage) {
         match msg {
-            MidiMessage::NoteOn { note, velocity, .. } => {
+            MidiMessage::NoteOn { channel, note, velocity } => {
                 let vel = velocity_to_float(velocity);
                 // Remove existing note if present
-                self.notes.retain(|n| n.note != note);
-                self.notes.push(NoteState { note, velocity: vel });
+                self.notes_held.retain(|n| n.note != note);
+                self.notes_held.push(NoteState { note, velocity: vel, channel });
             }
             MidiMessage::NoteOff { note, .. } => {
                 if !self.sustain {
-                    self.notes.retain(|n| n.note != note);
+                    self.notes_held.retain(|n| n.note != note);
                 }
             }
             MidiMessage::ControlChange { controller, value, .. } => {
@@ -86,7 +88,7 @@ impl MidiState {
                         self.mod_wheel = val;
                     }
                     cc::ALL_NOTES_OFF | cc::ALL_SOUND_OFF => {
-                        self.notes.clear();
+                        self.notes_held.clear();
                     }
                     cc::RESET_ALL => {
                         self.reset();
@@ -102,7 +104,7 @@ impl MidiState {
             }
             MidiMessage::PolyAftertouch { note, pressure, .. } => {
                 // Could track per-note pressure, but for now just use channel pressure
-                if self.notes.iter().any(|n| n.note == note) {
+                if self.notes_held.iter().any(|n| n.note == note) {
                     self.pressure = cc_to_float(pressure);
                 }
             }
@@ -111,8 +113,9 @@ impl MidiState {
     }
 
     /// Get held notes
-    pub fn notes(&self) -> &[NoteState] {
-        &self.notes
+    /// Get held notes
+    pub fn notes_held(&self) -> &[NoteState] {
+        &self.notes_held
     }
 
     /// Get CC value
@@ -152,7 +155,7 @@ impl MidiState {
 
     /// Reset state
     pub fn reset(&mut self) {
-        self.notes.clear();
+        self.notes_held.clear();
         self.cc = [0.0; 128];
         self.cc[cc::VOLUME as usize] = 1.0;
         self.cc[cc::EXPRESSION as usize] = 1.0;
@@ -177,7 +180,7 @@ mod tests {
     #[test]
     fn test_midi_state_new() {
         let state = MidiState::new();
-        assert!(state.notes.is_empty());
+        assert!(state.notes_held.is_empty());
         assert_eq!(state.pitch_bend, 0.0);
     }
 
@@ -189,8 +192,8 @@ mod tests {
             note: 60,
             velocity: 100,
         });
-        assert_eq!(state.notes.len(), 1);
-        assert_eq!(state.notes[0].note, 60);
+        assert_eq!(state.notes_held.len(), 1);
+        assert_eq!(state.notes_held[0].note, 60);
     }
 
     #[test]
@@ -206,7 +209,7 @@ mod tests {
             note: 60,
             velocity: 0,
         });
-        assert!(state.notes.is_empty());
+        assert!(state.notes_held.is_empty());
     }
 
     #[test]
@@ -231,7 +234,7 @@ mod tests {
             velocity: 0,
         });
         // Note should still be held
-        assert_eq!(state.notes.len(), 1);
+        assert_eq!(state.notes_held.len(), 1);
     }
 
     #[test]
@@ -275,7 +278,7 @@ mod tests {
             velocity: 100,
         });
         state.reset();
-        assert!(state.notes.is_empty());
+        assert!(state.notes_held.is_empty());
     }
 
     #[test]

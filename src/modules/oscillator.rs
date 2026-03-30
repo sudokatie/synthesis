@@ -10,8 +10,10 @@ pub enum Waveform {
     Square { pulse_width: f32 },
     Triangle,
     Noise,
-    /// Wavetable with samples and position (0.0-1.0 for morphing)
+    /// Wavetable with samples and position (0.0-1.0 for morphing between tables)
     Wavetable { table: Vec<f32>, position: f32 },
+    /// Multi-wavetable for morphing (multiple tables, position selects blend)
+    MultiWavetable { tables: Vec<Vec<f32>>, position: f32 },
 }
 
 impl Default for Waveform {
@@ -42,17 +44,34 @@ pub fn generate_wavetable(waveform: &str, size: usize) -> Vec<f32> {
     table
 }
 
-/// Oscillator with anti-aliasing
+/// Generate a set of wavetables for morphing (e.g., sine -> saw -> square)
+pub fn generate_morph_wavetables(size: usize) -> Vec<Vec<f32>> {
+    vec![
+        generate_wavetable("sine", size),
+        generate_wavetable("triangle", size),
+        generate_wavetable("saw", size),
+        generate_wavetable("square", size),
+    ]
+}
+
+/// Oscillator with anti-aliasing and gain control
 #[derive(Debug, Clone)]
 pub struct Oscillator {
     waveform: Waveform,
     frequency: f32,
-    phase: f32,
-    detune: f32,      // cents
+    /// Current phase (0.0-1.0), public for sync detection
+    pub phase: f32,
+    detune: f32,           // cents
+    gain: f32,             // output gain (0.0-1.0)
     sample_rate: f32,
     // Modulation inputs
-    fm_amount: f32,   // FM depth in Hz
-    pm_amount: f32,   // PM depth in radians
+    fm_amount: f32,        // FM depth in Hz
+    pm_amount: f32,        // PM depth in radians
+    // Oversampling for wavetables
+    oversample_factor: usize,
+    oversample_buffer: Vec<f32>,
+    // Lowpass state for oversampling decimation
+    lp_state: f32,
 }
 
 impl Oscillator {
@@ -63,10 +82,30 @@ impl Oscillator {
             frequency: 440.0,
             phase: 0.0,
             detune: 0.0,
+            gain: 1.0,
             sample_rate: sample_rate as f32,
             fm_amount: 0.0,
             pm_amount: 0.0,
+            oversample_factor: 4,
+            oversample_buffer: vec![0.0; 4],
+            lp_state: 0.0,
         }
+    }
+
+    /// Set output gain (0.0-1.0)
+    pub fn set_gain(&mut self, gain: f32) {
+        self.gain = gain.clamp(0.0, 1.0);
+    }
+
+    /// Get current gain
+    pub fn gain(&self) -> f32 {
+        self.gain
+    }
+
+    /// Set oversampling factor for wavetables (1, 2, 4, or 8)
+    pub fn set_oversample(&mut self, factor: usize) {
+        self.oversample_factor = factor.clamp(1, 8);
+        self.oversample_buffer.resize(self.oversample_factor, 0.0);
     }
 
     /// Set FM (frequency modulation) amount in Hz
@@ -85,14 +124,14 @@ impl Oscillator {
         let freq = freq.max(0.0);
         let dt = freq / self.sample_rate;
         
-        let sample = self.generate_sample(self.phase);
+        let sample = self.generate_sample(self.phase, dt);
         
         self.phase += dt;
         if self.phase >= 1.0 {
             self.phase -= 1.0;
         }
         
-        sample
+        sample * self.gain
     }
 
     /// Process with PM input (modulator signal)
@@ -104,14 +143,14 @@ impl Oscillator {
         let modulated_phase = (self.phase + pm_input * self.pm_amount / std::f32::consts::TAU).fract();
         let modulated_phase = if modulated_phase < 0.0 { modulated_phase + 1.0 } else { modulated_phase };
         
-        let sample = self.generate_sample(modulated_phase);
+        let sample = self.generate_sample(modulated_phase, dt);
         
         self.phase += dt;
         if self.phase >= 1.0 {
             self.phase -= 1.0;
         }
         
-        sample
+        sample * self.gain
     }
 
     /// Hard sync - reset phase when sync signal crosses zero
@@ -119,10 +158,20 @@ impl Oscillator {
         self.phase = 0.0;
     }
 
-    fn generate_sample(&self, phase: f32) -> f32 {
-        let freq = self.effective_frequency();
-        let dt = freq / self.sample_rate;
-        
+    /// Set wavetable position for morphing (0.0-1.0)
+    pub fn set_wavetable_position(&mut self, position: f32) {
+        match &mut self.waveform {
+            Waveform::Wavetable { position: pos, .. } => {
+                *pos = position.clamp(0.0, 1.0);
+            }
+            Waveform::MultiWavetable { position: pos, .. } => {
+                *pos = position.clamp(0.0, 1.0);
+            }
+            _ => {}
+        }
+    }
+
+    fn generate_sample(&self, phase: f32, dt: f32) -> f32 {
         match &self.waveform {
             Waveform::Sine => (phase * std::f32::consts::TAU).sin(),
             Waveform::Saw => saw_polyblep(phase, dt),
@@ -136,14 +185,61 @@ impl Oscillator {
             }
             Waveform::Noise => rand::random::<f32>() * 2.0 - 1.0,
             Waveform::Wavetable { table, .. } => {
-                if table.is_empty() {
-                    0.0
-                } else {
-                    let index = phase * table.len() as f32;
-                    cubic_interp(table, index)
-                }
+                self.read_wavetable_oversampled(table, phase)
+            }
+            Waveform::MultiWavetable { tables, position } => {
+                self.read_multi_wavetable(tables, *position, phase)
             }
         }
+    }
+
+    /// Read from wavetable with oversampling for anti-aliasing
+    fn read_wavetable_oversampled(&self, table: &[f32], phase: f32) -> f32 {
+        if table.is_empty() {
+            return 0.0;
+        }
+
+        if self.oversample_factor <= 1 {
+            // No oversampling, just interpolate
+            let index = phase * table.len() as f32;
+            return cubic_interp(table, index);
+        }
+
+        // Oversample: read multiple points and lowpass filter
+        let mut sum = 0.0;
+        let step = 1.0 / self.oversample_factor as f32;
+        
+        for i in 0..self.oversample_factor {
+            let sub_phase = (phase + step * i as f32 / table.len() as f32).fract();
+            let index = sub_phase * table.len() as f32;
+            sum += cubic_interp(table, index);
+        }
+        
+        sum / self.oversample_factor as f32
+    }
+
+    /// Read from multi-wavetable with morphing
+    fn read_multi_wavetable(&self, tables: &[Vec<f32>], position: f32, phase: f32) -> f32 {
+        if tables.is_empty() {
+            return 0.0;
+        }
+        
+        if tables.len() == 1 {
+            return self.read_wavetable_oversampled(&tables[0], phase);
+        }
+
+        // Calculate which two tables to blend between
+        let float_index = position * (tables.len() - 1) as f32;
+        let index_a = (float_index.floor() as usize).min(tables.len() - 1);
+        let index_b = (index_a + 1).min(tables.len() - 1);
+        let blend = float_index.fract();
+
+        // Read from both tables
+        let sample_a = self.read_wavetable_oversampled(&tables[index_a], phase);
+        let sample_b = self.read_wavetable_oversampled(&tables[index_b], phase);
+
+        // Crossfade
+        sample_a * (1.0 - blend) + sample_b * blend
     }
 
     /// Set frequency in Hz
@@ -164,6 +260,7 @@ impl Oscillator {
     /// Reset phase
     pub fn reset(&mut self) {
         self.phase = 0.0;
+        self.lp_state = 0.0;
     }
 
     /// Get effective frequency with detune
@@ -176,7 +273,7 @@ impl Oscillator {
         let freq = self.effective_frequency();
         let dt = freq / self.sample_rate;
 
-        let sample = self.generate_sample(self.phase);
+        let sample = self.generate_sample(self.phase, dt);
 
         // Advance phase
         self.phase += dt;
@@ -184,7 +281,7 @@ impl Oscillator {
             self.phase -= 1.0;
         }
 
-        sample
+        sample * self.gain
     }
 
     /// Process buffer
@@ -203,6 +300,28 @@ mod tests {
     fn test_oscillator_new() {
         let osc = Oscillator::new(Waveform::Saw, 44100);
         assert_eq!(osc.frequency, 440.0);
+        assert_eq!(osc.gain, 1.0);
+    }
+
+    #[test]
+    fn test_oscillator_gain() {
+        let mut osc = Oscillator::new(Waveform::Sine, 44100);
+        osc.set_gain(0.5);
+        assert_eq!(osc.gain(), 0.5);
+        
+        // Process and check output is scaled
+        osc.set_frequency(440.0);
+        let sample = osc.process_sample();
+        assert!(sample.abs() <= 0.5);
+    }
+
+    #[test]
+    fn test_oscillator_gain_clamp() {
+        let mut osc = Oscillator::new(Waveform::Sine, 44100);
+        osc.set_gain(2.0);
+        assert_eq!(osc.gain(), 1.0);
+        osc.set_gain(-0.5);
+        assert_eq!(osc.gain(), 0.0);
     }
 
     #[test]
@@ -238,7 +357,6 @@ mod tests {
         osc.set_frequency(440.0);
         for _ in 0..1000 {
             let sample = osc.process_sample();
-            // PolyBLEP can overshoot near discontinuities
             assert!(sample >= -2.5 && sample <= 2.5);
         }
     }
@@ -248,15 +366,14 @@ mod tests {
         let mut osc = Oscillator::new(Waveform::Noise, 44100);
         let s1 = osc.process_sample();
         let s2 = osc.process_sample();
-        // Noise should vary (statistically almost always)
-        assert!(s1 != s2 || s1 == 0.0); // Allow rare equality
+        assert!(s1 != s2 || s1 == 0.0);
     }
 
     #[test]
     fn test_detune() {
         let mut osc = Oscillator::new(Waveform::Sine, 44100);
         osc.set_frequency(440.0);
-        osc.set_detune(1200.0); // One octave up
+        osc.set_detune(1200.0);
         assert!((osc.effective_frequency() - 880.0).abs() < 1.0);
     }
 
@@ -265,7 +382,6 @@ mod tests {
         let mut osc = Oscillator::new(Waveform::Sine, 44100);
         let mut buffer = vec![0.0; 64];
         osc.process(&mut buffer);
-        // Should have non-zero values
         assert!(buffer.iter().any(|&s| s != 0.0));
     }
 
@@ -342,7 +458,6 @@ mod tests {
                 high_count += 1;
             }
         }
-        // With 25% pulse width, roughly 25% should be high
         let ratio = high_count as f32 / 4410.0;
         assert!(ratio > 0.15 && ratio < 0.35, "Pulse width ratio: {}", ratio);
     }
@@ -353,11 +468,9 @@ mod tests {
         osc.set_frequency(440.0);
         osc.set_fm_amount(100.0);
         
-        // FM should change pitch based on modulator
-        let s1 = osc.process_sample_fm(0.0);  // No mod
+        let s1 = osc.process_sample_fm(0.0);
         osc.reset();
-        let s2 = osc.process_sample_fm(1.0);  // +100Hz
-        // Both should produce valid samples
+        let s2 = osc.process_sample_fm(1.0);
         assert!(s1.abs() <= 1.0);
         assert!(s2.abs() <= 1.0);
     }
@@ -368,11 +481,9 @@ mod tests {
         osc.set_frequency(440.0);
         osc.set_pm_amount(std::f32::consts::PI);
         
-        // PM should shift phase
         let s1 = osc.process_sample_pm(0.0);
         osc.reset();
-        let s2 = osc.process_sample_pm(0.5);  // Half cycle shift
-        // Both valid
+        let s2 = osc.process_sample_pm(0.5);
         assert!(s1.abs() <= 1.0);
         assert!(s2.abs() <= 1.0);
     }
@@ -382,14 +493,85 @@ mod tests {
         let mut osc = Oscillator::new(Waveform::Saw, 44100);
         osc.set_frequency(440.0);
         
-        // Advance phase
         for _ in 0..100 {
             osc.process_sample();
         }
         assert!(osc.phase > 0.0);
         
-        // Sync resets phase
         osc.sync();
         assert_eq!(osc.phase, 0.0);
+    }
+
+    #[test]
+    fn test_multi_wavetable() {
+        let tables = generate_morph_wavetables(256);
+        let mut osc = Oscillator::new(
+            Waveform::MultiWavetable { tables, position: 0.0 },
+            44100,
+        );
+        osc.set_frequency(440.0);
+        
+        // Test at different positions
+        for pos in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            osc.set_wavetable_position(pos);
+            let sample = osc.process_sample();
+            assert!(sample.abs() <= 1.5, "Sample out of range at position {}: {}", pos, sample);
+        }
+    }
+
+    #[test]
+    fn test_wavetable_position_morphing() {
+        let tables = generate_morph_wavetables(256);
+        let mut osc = Oscillator::new(
+            Waveform::MultiWavetable { tables, position: 0.0 },
+            44100,
+        );
+        osc.set_frequency(440.0);
+        
+        // Get samples at position 0 (sine-like)
+        osc.reset();
+        osc.set_wavetable_position(0.0);
+        let mut sum_0 = 0.0;
+        for _ in 0..1000 {
+            sum_0 += osc.process_sample().abs();
+        }
+        
+        // Get samples at position 1.0 (square-like, more energy)
+        osc.reset();
+        osc.set_wavetable_position(1.0);
+        let mut sum_1 = 0.0;
+        for _ in 0..1000 {
+            sum_1 += osc.process_sample().abs();
+        }
+        
+        // Square should have more energy than sine
+        assert!(sum_1 > sum_0 * 0.9, "Morphing not working: sum_0={}, sum_1={}", sum_0, sum_1);
+    }
+
+    #[test]
+    fn test_oversampling() {
+        let table = generate_wavetable("saw", 256);
+        let mut osc = Oscillator::new(
+            Waveform::Wavetable { table, position: 0.0 },
+            44100,
+        );
+        osc.set_frequency(440.0);
+        
+        // Test with different oversample factors
+        for factor in [1, 2, 4, 8] {
+            osc.set_oversample(factor);
+            osc.reset();
+            let sample = osc.process_sample();
+            assert!(sample.is_finite(), "Non-finite sample with oversample factor {}", factor);
+        }
+    }
+
+    #[test]
+    fn test_generate_morph_wavetables() {
+        let tables = generate_morph_wavetables(256);
+        assert_eq!(tables.len(), 4);
+        for table in &tables {
+            assert_eq!(table.len(), 256);
+        }
     }
 }
