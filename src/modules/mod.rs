@@ -6,6 +6,6 @@ pub mod lfo;
 pub mod oscillator;
 
 pub use envelope::{Envelope, EnvelopeStage};
-pub use filter::{Filter, FilterMode, MoogLadder, StateVariableFilter};
+pub use filter::{Filter, FilterMode, FormantData, FormantFilter, MoogLadder, StateVariableFilter, Vowel};
 pub use lfo::{Lfo, LfoSync, Polarity};
 pub use oscillator::{generate_morph_wavetables, generate_wavetable, Oscillator, Waveform};

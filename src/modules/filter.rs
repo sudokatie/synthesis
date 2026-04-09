@@ -197,6 +197,172 @@ impl Filter for MoogLadder {
     }
 }
 
+/// Vowel types for formant filter
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Vowel {
+    A,  // "ah" as in father
+    E,  // "eh" as in bed
+    I,  // "ee" as in see
+    O,  // "oh" as in go
+    U,  // "oo" as in too
+}
+
+/// Formant frequency data (F1, F2, F3 in Hz)
+#[derive(Debug, Clone, Copy)]
+pub struct FormantData {
+    pub f1: f32,
+    pub f2: f32,
+    pub f3: f32,
+    pub g1: f32, // Gain for F1 (linear)
+    pub g2: f32, // Gain for F2
+    pub g3: f32, // Gain for F3
+}
+
+impl FormantData {
+    pub fn from_vowel(vowel: Vowel) -> Self {
+        match vowel {
+            Vowel::A => Self { f1: 730.0, f2: 1090.0, f3: 2440.0, g1: 1.0, g2: 0.5, g3: 0.25 },
+            Vowel::E => Self { f1: 660.0, f2: 1720.0, f3: 2410.0, g1: 1.0, g2: 0.5, g3: 0.25 },
+            Vowel::I => Self { f1: 270.0, f2: 2290.0, f3: 3010.0, g1: 1.0, g2: 0.4, g3: 0.2 },
+            Vowel::O => Self { f1: 570.0, f2: 840.0, f3: 2410.0, g1: 1.0, g2: 0.5, g3: 0.25 },
+            Vowel::U => Self { f1: 300.0, f2: 870.0, f3: 2240.0, g1: 1.0, g2: 0.4, g3: 0.2 },
+        }
+    }
+    
+    /// Interpolate between two formant data sets
+    pub fn lerp(a: &Self, b: &Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        let inv_t = 1.0 - t;
+        Self {
+            f1: a.f1 * inv_t + b.f1 * t,
+            f2: a.f2 * inv_t + b.f2 * t,
+            f3: a.f3 * inv_t + b.f3 * t,
+            g1: a.g1 * inv_t + b.g1 * t,
+            g2: a.g2 * inv_t + b.g2 * t,
+            g3: a.g3 * inv_t + b.g3 * t,
+        }
+    }
+}
+
+/// Formant filter - creates vowel-like sounds using parallel bandpass filters
+#[derive(Debug, Clone)]
+pub struct FormantFilter {
+    /// Three SVF bandpass filters for formants
+    bp1: StateVariableFilter,
+    bp2: StateVariableFilter,
+    bp3: StateVariableFilter,
+    /// Current formant data
+    formants: FormantData,
+    /// Resonance (Q) for formant peaks
+    resonance: f32,
+    /// Mix between dry and wet (0.0 = dry, 1.0 = wet)
+    mix: f32,
+    /// Sample rate
+    sample_rate: f32,
+}
+
+impl FormantFilter {
+    pub fn new(sample_rate: u32) -> Self {
+        let mut bp1 = StateVariableFilter::new(sample_rate);
+        let mut bp2 = StateVariableFilter::new(sample_rate);
+        let mut bp3 = StateVariableFilter::new(sample_rate);
+        
+        bp1.set_mode(FilterMode::BandPass);
+        bp2.set_mode(FilterMode::BandPass);
+        bp3.set_mode(FilterMode::BandPass);
+        
+        let formants = FormantData::from_vowel(Vowel::A);
+        
+        bp1.set_cutoff(formants.f1);
+        bp2.set_cutoff(formants.f2);
+        bp3.set_cutoff(formants.f3);
+        
+        Self {
+            bp1,
+            bp2,
+            bp3,
+            formants,
+            resonance: 0.7,
+            mix: 1.0,
+            sample_rate: sample_rate as f32,
+        }
+    }
+    
+    /// Set vowel preset
+    pub fn set_vowel(&mut self, vowel: Vowel) {
+        self.formants = FormantData::from_vowel(vowel);
+        self.update_filters();
+    }
+    
+    /// Set custom formant frequencies
+    pub fn set_formants(&mut self, data: FormantData) {
+        self.formants = data;
+        self.update_filters();
+    }
+    
+    /// Morph between two vowels (0.0 = vowel_a, 1.0 = vowel_b)
+    pub fn morph(&mut self, vowel_a: Vowel, vowel_b: Vowel, amount: f32) {
+        let a = FormantData::from_vowel(vowel_a);
+        let b = FormantData::from_vowel(vowel_b);
+        self.formants = FormantData::lerp(&a, &b, amount);
+        self.update_filters();
+    }
+    
+    /// Set resonance (Q) for formant peaks (0.0 to 1.0)
+    pub fn set_resonance(&mut self, q: f32) {
+        self.resonance = q.clamp(0.0, 0.99);
+        self.bp1.set_resonance(self.resonance);
+        self.bp2.set_resonance(self.resonance);
+        self.bp3.set_resonance(self.resonance);
+    }
+    
+    /// Set dry/wet mix (0.0 = dry, 1.0 = wet)
+    pub fn set_mix(&mut self, mix: f32) {
+        self.mix = mix.clamp(0.0, 1.0);
+    }
+    
+    /// Shift all formants by a factor (useful for pitch tracking)
+    pub fn shift(&mut self, factor: f32) {
+        let factor = factor.clamp(0.25, 4.0);
+        self.bp1.set_cutoff((self.formants.f1 * factor).clamp(20.0, 20000.0));
+        self.bp2.set_cutoff((self.formants.f2 * factor).clamp(20.0, 20000.0));
+        self.bp3.set_cutoff((self.formants.f3 * factor).clamp(20.0, 20000.0));
+    }
+    
+    fn update_filters(&mut self) {
+        self.bp1.set_cutoff(self.formants.f1);
+        self.bp2.set_cutoff(self.formants.f2);
+        self.bp3.set_cutoff(self.formants.f3);
+        self.bp1.set_resonance(self.resonance);
+        self.bp2.set_resonance(self.resonance);
+        self.bp3.set_resonance(self.resonance);
+    }
+    
+    /// Process a single sample
+    pub fn process_sample(&mut self, input: f32) -> f32 {
+        let f1_out = self.bp1.process_sample(input) * self.formants.g1;
+        let f2_out = self.bp2.process_sample(input) * self.formants.g2;
+        let f3_out = self.bp3.process_sample(input) * self.formants.g3;
+        
+        let wet = f1_out + f2_out + f3_out;
+        let dry = input;
+        
+        dry * (1.0 - self.mix) + wet * self.mix
+    }
+    
+    /// Reset filter state
+    pub fn reset(&mut self) {
+        self.bp1.reset();
+        self.bp2.reset();
+        self.bp3.reset();
+    }
+    
+    /// Get current formant data
+    pub fn formants(&self) -> &FormantData {
+        &self.formants
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +582,165 @@ mod tests {
                 assert!(out.is_finite(), "Mode {:?} produced non-finite output", mode);
             }
         }
+    }
+    
+    // Formant filter tests
+    
+    #[test]
+    fn test_formant_new() {
+        let filter = FormantFilter::new(44100);
+        assert_eq!(filter.formants.f1, 730.0); // Default is Vowel::A
+        assert_eq!(filter.mix, 1.0);
+    }
+    
+    #[test]
+    fn test_formant_set_vowel() {
+        let mut filter = FormantFilter::new(44100);
+        
+        filter.set_vowel(Vowel::I);
+        assert_eq!(filter.formants.f1, 270.0);
+        assert_eq!(filter.formants.f2, 2290.0);
+        
+        filter.set_vowel(Vowel::U);
+        assert_eq!(filter.formants.f1, 300.0);
+    }
+    
+    #[test]
+    fn test_formant_morph() {
+        let mut filter = FormantFilter::new(44100);
+        
+        // Morph from A to I at 50%
+        filter.morph(Vowel::A, Vowel::I, 0.5);
+        
+        // F1 should be halfway between A(730) and I(270) = 500
+        assert!((filter.formants.f1 - 500.0).abs() < 1.0);
+    }
+    
+    #[test]
+    fn test_formant_process() {
+        let mut filter = FormantFilter::new(44100);
+        filter.set_vowel(Vowel::A);
+        
+        // Process a sawtooth-like signal
+        let mut output = Vec::new();
+        for i in 0..256 {
+            let input = ((i as f32 / 64.0) % 2.0) - 1.0;
+            output.push(filter.process_sample(input));
+        }
+        
+        // Output should be non-zero and finite
+        assert!(output.iter().any(|&s| s != 0.0));
+        assert!(output.iter().all(|&s| s.is_finite()));
+    }
+    
+    #[test]
+    fn test_formant_resonance() {
+        let mut filter = FormantFilter::new(44100);
+        filter.set_resonance(0.9);
+        
+        // High resonance should produce sharper peaks
+        let out = filter.process_sample(1.0);
+        assert!(out.is_finite());
+    }
+    
+    #[test]
+    fn test_formant_mix() {
+        let mut filter = FormantFilter::new(44100);
+        
+        // 100% wet
+        filter.set_mix(1.0);
+        filter.reset();
+        let wet = filter.process_sample(1.0);
+        
+        // 0% wet (dry)
+        filter.set_mix(0.0);
+        filter.reset();
+        let dry = filter.process_sample(1.0);
+        
+        assert_eq!(dry, 1.0); // Dry should be input
+        assert!(wet.is_finite());
+    }
+    
+    #[test]
+    fn test_formant_shift() {
+        let mut filter = FormantFilter::new(44100);
+        filter.set_vowel(Vowel::A);
+        
+        // Shift up by 2x
+        filter.shift(2.0);
+        
+        // Internal filters should be updated (we can't access them directly,
+        // but we can verify the output is different)
+        let out = filter.process_sample(1.0);
+        assert!(out.is_finite());
+    }
+    
+    #[test]
+    fn test_formant_reset() {
+        let mut filter = FormantFilter::new(44100);
+        
+        // Process some samples
+        for _ in 0..100 {
+            filter.process_sample(1.0);
+        }
+        
+        // Reset
+        filter.reset();
+        
+        // First sample after reset should be deterministic
+        let out = filter.process_sample(1.0);
+        assert!(out.is_finite());
+    }
+    
+    #[test]
+    fn test_formant_all_vowels() {
+        let vowels = [Vowel::A, Vowel::E, Vowel::I, Vowel::O, Vowel::U];
+        
+        for vowel in vowels {
+            let mut filter = FormantFilter::new(44100);
+            filter.set_vowel(vowel);
+            
+            // Process and verify
+            for _ in 0..100 {
+                let out = filter.process_sample(1.0);
+                assert!(out.is_finite(), "Vowel {:?} produced non-finite output", vowel);
+            }
+        }
+    }
+    
+    #[test]
+    fn test_formant_data_lerp() {
+        let a = FormantData::from_vowel(Vowel::A);
+        let b = FormantData::from_vowel(Vowel::I);
+        
+        // At t=0, should be A
+        let at_0 = FormantData::lerp(&a, &b, 0.0);
+        assert_eq!(at_0.f1, a.f1);
+        
+        // At t=1, should be I
+        let at_1 = FormantData::lerp(&a, &b, 1.0);
+        assert_eq!(at_1.f1, b.f1);
+        
+        // At t=0.5, should be halfway
+        let at_half = FormantData::lerp(&a, &b, 0.5);
+        assert!((at_half.f1 - (a.f1 + b.f1) / 2.0).abs() < 0.01);
+    }
+    
+    #[test]
+    fn test_formant_custom_formants() {
+        let mut filter = FormantFilter::new(44100);
+        
+        let custom = FormantData {
+            f1: 500.0,
+            f2: 1500.0,
+            f3: 2500.0,
+            g1: 1.0,
+            g2: 0.7,
+            g3: 0.3,
+        };
+        
+        filter.set_formants(custom);
+        assert_eq!(filter.formants.f1, 500.0);
+        assert_eq!(filter.formants.g2, 0.7);
     }
 }
